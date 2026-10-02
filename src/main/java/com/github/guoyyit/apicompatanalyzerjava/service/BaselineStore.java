@@ -23,7 +23,10 @@ import java.util.Set;
 @Component
 public class BaselineStore {
 
-    public record BaselineData(ApiSnapshot snapshot, Set<String> suppressedKeys) {
+    public record BaselineData(ApiSnapshot snapshot, Set<String> suppressedKeys, String fingerprint) {
+        public BaselineData(ApiSnapshot snapshot, Set<String> suppressedKeys) {
+            this(snapshot, suppressedKeys, "");
+        }
     }
 
     record ElementDto(String kind, String ownerType, String name, String returnType,
@@ -31,18 +34,26 @@ public class BaselineStore {
                       String sourceFile, int line) {
     }
 
-    record BaselineDto(String version, Set<String> suppressedKeys, List<ElementDto> elements) {
+    record BaselineDto(String version, String fingerprint, Set<String> suppressedKeys,
+                       List<ElementDto> elements,
+                       Map<String, List<String>> typeSupertypes,
+                       Map<String, String> typeSuperclasses) {
     }
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public void save(ApiSnapshot snapshot, Set<String> suppressedKeys, Path file) {
+        save(snapshot, suppressedKeys, "", file);
+    }
+
+    public void save(ApiSnapshot snapshot, Set<String> suppressedKeys, String fingerprint, Path file) {
         List<ElementDto> elements = snapshot.elements().values().stream()
                 .map(el -> new ElementDto(el.kind().name(), el.ownerType(), el.name(),
                         el.returnType(), el.parameterTypes(), el.access().name(),
                         el.modifiers(), el.sourceFile(), el.line()))
                 .toList();
-        BaselineDto dto = new BaselineDto(snapshot.version(), suppressedKeys, elements);
+        BaselineDto dto = new BaselineDto(snapshot.version(), fingerprint, suppressedKeys, elements,
+                snapshot.typeSupertypes(), snapshot.typeSuperclasses());
         try {
             objectMapper.writerWithDefaultPrettyPrinter().writeValue(file.toFile(), dto);
         } catch (IOException e) {
@@ -66,8 +77,10 @@ public class BaselineStore {
                     d.sourceFile(), d.line());
             elements.putIfAbsent(el.key(), el);
         }
-        ApiSnapshot snapshot = new ApiSnapshot(dto.version(), elements, Map.of(), Map.of(), Map.of());
+        ApiSnapshot snapshot = new ApiSnapshot(dto.version(), elements, Map.of(), Map.of(), Map.of(),
+                dto.typeSupertypes() == null ? Map.of() : dto.typeSupertypes(),
+                dto.typeSuperclasses() == null ? Map.of() : dto.typeSuperclasses());
         Set<String> suppressed = dto.suppressedKeys() == null ? Set.of() : dto.suppressedKeys();
-        return new BaselineData(snapshot, suppressed);
+        return new BaselineData(snapshot, suppressed, dto.fingerprint() == null ? "" : dto.fingerprint());
     }
 }

@@ -2,6 +2,7 @@ package com.github.guoyyit.apicompatanalyzerjava.model;
 
 import com.fasterxml.jackson.annotation.JsonAutoDetect;
 
+import java.util.Objects;
 import java.util.List;
 
 @JsonAutoDetect(fieldVisibility = JsonAutoDetect.Visibility.ANY,
@@ -45,4 +46,24 @@ public final class ApiChange {
     public List<CallSite> affectedCallSites() { return affectedCallSites; }
     /** True when an exemption declaration covers this change. */
     public boolean suppressed() { return suppressed; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof ApiChange other)) return false;
+        return breaking == other.breaking
+                && suppressed == other.suppressed
+                && kind == other.kind
+                && Objects.equals(elementKey, other.elementKey)
+                && Objects.equals(description, other.description)
+                && Objects.equals(oldDetail, other.oldDetail)
+                && Objects.equals(newDetail, other.newDetail)
+                && Objects.equals(affectedCallSites, other.affectedCallSites);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(kind, breaking, elementKey, description,
+                oldDetail, newDetail, affectedCallSites, suppressed);
+    }
 }

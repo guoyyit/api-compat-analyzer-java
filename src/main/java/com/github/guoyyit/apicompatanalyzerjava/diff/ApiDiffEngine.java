@@ -10,7 +10,11 @@ import com.github.guoyyit.apicompatanalyzerjava.model.ElementKind;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -34,6 +38,7 @@ public class ApiDiffEngine {
         List<ApiChange> changes = new ArrayList<>();
         Map<String, ApiElement> oldElements = baseline.elements();
         Map<String, ApiElement> newElements = current.elements();
+        Map<String, ApiElement> newTypes = typeElements(newElements);
 
         for (ApiElement oldEl : oldElements.values()) {
             ApiElement newEl = newElements.get(oldEl.key());
@@ -47,10 +52,10 @@ public class ApiDiffEngine {
         }
         for (ApiElement newEl : newElements.values()) {
             if (!oldElements.containsKey(newEl.key())) {
-                changes.add(change(ChangeKind.ADDED, false, newEl,
-                        describe(newEl) + " was added", "", detailOf(newEl), List.of()));
+                handleAdded(newEl, newTypes, current, changes);
             }
         }
+        detectSuperclassChanges(baseline, current, newTypes, changes);
 
         changes.sort(Comparator.comparing(ApiChange::elementKey).thenComparing(c -> c.kind().ordinal()));
 
@@ -60,6 +65,182 @@ public class ApiDiffEngine {
             result.add(new ApiChange(c.kind(), c.breaking(), c.elementKey(), c.description(),
                     c.oldDetail(), c.newDetail(), c.affectedCallSites(), suppressed));
         }
+        return result;
+    }
+
+    private static Map<String, ApiElement> typeElements(Map<String, ApiElement> elements) {
+        Map<String, ApiElement> types = new HashMap<>();
+        for (ApiElement el : elements.values()) {
+            if (el.kind() == ElementKind.TYPE) {
+                types.put(el.name(), el);
+            }
+        }
+        return types;
+    }
+
+    /**
+     * Classifies a newly appearing element. Effective members inherited from a
+     * supertype produce no change of their own (the owning type's change does).
+     * A new abstract obligation (abstract method on a class, or a non-default
+     * method on an interface) is breaking and lists every concrete subtype that
+     * does not inherit an implementation of the method.
+     */
+    private void handleAdded(ApiElement newEl, Map<String, ApiElement> types,
+                             ApiSnapshot current, List<ApiChange> changes) {
+        if (newEl.kind() == ElementKind.TYPE) {
+            changes.add(change(ChangeKind.ADDED, false, newEl,
+                    describe(newEl) + " was added", "", detailOf(newEl), List.of()));
+            return;
+        }
+        if (isInheritedEffectiveMember(newEl, types)) {
+            return; // inherited expansion noise; declared owner change is reported separately
+        }
+        if (newEl.kind() == ElementKind.METHOD && imposesNewObligation(newEl, types)) {
+            List<CallSite> sites = obligationCallSites(newEl, current, types);
+            changes.add(change(ChangeKind.ABSTRACT_METHOD_ADDED, true, newEl,
+                    describe(newEl) + " was added as an abstract method; downstream implementors "
+                            + "must provide an implementation",
+                    "", detailOf(newEl), sites));
+            return;
+        }
+        changes.add(change(ChangeKind.ADDED, false, newEl,
+                describe(newEl) + " was added", "", detailOf(newEl), List.of()));
+    }
+
+    private static boolean isInheritedEffectiveMember(ApiElement el, Map<String, ApiElement> types) {
+        ApiElement ownerType = types.get(el.ownerType());
+        return ownerType != null && !ownerType.sourceFile().equals(el.sourceFile());
+    }
+
+    private static boolean imposesNewObligation(ApiElement method, Map<String, ApiElement> types) {
+        ApiElement ownerType = types.get(method.ownerType());
+        if (ownerType == null) {
+            return false;
+        }
+        boolean isInterface = "INTERFACE".equals(ownerType.returnType());
+        if (isInterface) {
+            // Default and static interface methods have an implementation; abstract ones do not.
+            return !method.modifiers().contains("default") && !method.modifiers().contains("static");
+        }
+        return method.modifiers().contains("abstract");
+    }
+
+    /**
+     * Collects declaration and usage sites of every concrete subtype that is
+     * missing an inherited implementation of the new abstract method.
+     */
+    private List<CallSite> obligationCallSites(ApiElement method, ApiSnapshot current,
+                                               Map<String, ApiElement> types) {
+        String owner = method.ownerType();
+        String memberKey = "METHOD:" + owner + "#" + method.name()
+                + "(" + String.join(",", method.parameterTypes()) + ")";
+        Set<CallSite> sites = new LinkedHashSet<>();
+        for (String subtype : concreteSubtypesMissingImplementation(owner, memberKey, current, types)) {
+            ApiElement subtypeElement = types.get(subtype);
+            if (subtypeElement != null) {
+                sites.addAll(affectedCallSites(subtypeElement, current));
+            }
+        }
+        return sortSites(sites);
+    }
+
+    private static List<String> concreteSubtypesMissingImplementation(
+            String rootType, String methodKey, ApiSnapshot current, Map<String, ApiElement> types) {
+        List<String> result = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        Deque<String> queue = new ArrayDeque<>(directSubtypes(rootType, current, seen));
+        while (!queue.isEmpty()) {
+            String subtype = queue.removeFirst();
+            if (!seen.add(subtype)) {
+                continue;
+            }
+            for (String child : directSubtypes(subtype, current, new HashSet<>())) {
+                if (!seen.contains(child)) {
+                    queue.addLast(child);
+                }
+            }
+            ApiElement typeElement = types.get(subtype);
+            if (typeElement == null || !"CLASS".equals(typeElement.returnType())
+                    || typeElement.modifiers().contains("abstract")) {
+                continue; // out of tree or abstract: only its concrete descendants can break
+            }
+            ApiElement effective = current.elements().get(
+                    methodKey.replace(rootType, subtype));
+            if (effective != null && !effective.modifiers().contains("abstract")) {
+                continue; // inherits or declares a concrete implementation
+            }
+            result.add(subtype);
+        }
+        result.sort(String::compareTo);
+        return result;
+    }
+
+    private static List<String> directSubtypes(String typeFqn, ApiSnapshot current, Set<String> filter) {
+        List<String> children = new ArrayList<>();
+        current.typeSupertypes().forEach((candidate, supers) -> {
+            if (!filter.contains(candidate) && supers.contains(typeFqn)) {
+                children.add(candidate);
+            }
+        });
+        children.sort(String::compareTo);
+        return children;
+    }
+
+    private static List<CallSite> sortSites(Set<CallSite> sites) {
+        List<CallSite> sorted = new ArrayList<>(sites);
+        sorted.sort(Comparator.comparing(CallSite::file).thenComparingInt(CallSite::line)
+                .thenComparingInt(CallSite::column).thenComparing(CallSite::referencedKey));
+        return sorted;
+    }
+
+    /** Direct superclass added/removed/replaced is always breaking. */
+    private void detectSuperclassChanges(ApiSnapshot baseline, ApiSnapshot current,
+                                         Map<String, ApiElement> newTypes, List<ApiChange> changes) {
+        baseline.typeSuperclasses().forEach((typeFqn, oldSuper) -> {
+            if (!newTypes.containsKey(typeFqn)) {
+                return; // type removal is already reported
+            }
+            String newSuper = current.typeSuperclasses().getOrDefault(typeFqn, "");
+            if (oldSuper.equals(newSuper)) {
+                return;
+            }
+            ApiElement typeElement = newTypes.get(typeFqn);
+            if (!"CLASS".equals(typeElement.returnType())) {
+                return;
+            }
+            String description;
+            if (oldSuper.isEmpty()) {
+                description = "Type " + typeFqn + " now extends superclass " + newSuper;
+            } else if (newSuper.isEmpty()) {
+                description = "Type " + typeFqn + " no longer extends superclass " + oldSuper;
+            } else {
+                description = "Type " + typeFqn + " superclass changed from " + oldSuper + " to " + newSuper;
+            }
+            Set<CallSite> sites = new LinkedHashSet<>();
+            for (String affected : typeAndTransitiveSubtypes(typeFqn, current)) {
+                ApiElement affectedElement = newTypes.get(affected);
+                if (affectedElement != null) {
+                    sites.addAll(affectedCallSites(affectedElement, current));
+                }
+            }
+            changes.add(new ApiChange(ChangeKind.SUPERCLASS_CHANGED, true,
+                    "TYPE:" + typeFqn, description, oldSuper, newSuper, sortSites(sites)));
+        });
+    }
+
+    private static List<String> typeAndTransitiveSubtypes(String rootType, ApiSnapshot current) {
+        List<String> result = new ArrayList<>();
+        Deque<String> queue = new ArrayDeque<>();
+        queue.add(rootType);
+        while (!queue.isEmpty()) {
+            String type = queue.removeFirst();
+            if (result.contains(type)) {
+                continue;
+            }
+            result.add(type);
+            queue.addAll(directSubtypes(type, current, new HashSet<>(result)));
+        }
+        result.sort(String::compareTo);
         return result;
     }
 
@@ -135,6 +316,11 @@ public class ApiDiffEngine {
         switch (element.kind()) {
             case TYPE -> {
                 String fqn = element.name();
+                // The type declaration itself is always an affected location.
+                if (element.line() > 0) {
+                    result.add(new CallSite(element.sourceFile(), element.line(), -1,
+                            fqn, "TYPE:" + fqn));
+                }
                 collect(refs, "TYPE:" + fqn, result);
                 String memberPrefix = "MEMBER:" + fqn + "#";
                 String fieldPrefix = "FIELD:" + fqn + "#";

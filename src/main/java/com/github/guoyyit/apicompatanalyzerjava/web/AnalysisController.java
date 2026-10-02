@@ -53,14 +53,16 @@ public class AnalysisController {
     @PostMapping("/baseline/save")
     public Map<String, Object> saveBaseline(@RequestParam String path) {
         baselineStore.save(analysisService.baselineSnapshot(),
-                analysisService.baselineSuppressions(), Path.of(path));
+                analysisService.baselineSuppressions(),
+                analysisService.baselineFingerprint(), Path.of(path));
         return Map.of("saved", path);
     }
 
     @PostMapping("/baseline/load")
     public Map<String, Object> loadBaseline(@RequestParam String path) {
         BaselineStore.BaselineData data = baselineStore.load(Path.of(path));
-        analysisService.installBaselineSnapshot(data.snapshot(), data.suppressedKeys());
+        analysisService.installBaselineSnapshot(data.snapshot(), data.suppressedKeys(),
+                data.fingerprint());
         return Map.of("baselineVersion", data.snapshot().version(),
                 "elements", data.snapshot().elements().size(),
                 "suppressions", data.suppressedKeys().size());

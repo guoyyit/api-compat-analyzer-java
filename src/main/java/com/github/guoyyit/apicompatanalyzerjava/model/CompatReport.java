@@ -11,8 +11,16 @@ import java.util.List;
 /**
  * Immutable analysis report. Readers always observe one complete
  * version; reports are published atomically, never mutated in place.
+ *
+ * <p>Reports are fully deterministic: {@code reportVersion} is derived from
+ * the complete baseline and current input contents, and {@code generatedAt}
+ * carries no wall-clock information (it is fixed to {@link #DETERMINISTIC_EPOCH})
+ * so the same inputs always serialize to byte-identical reports.
  */
 public final class CompatReport {
+    /** Fixed, content-independent timestamp used for every deterministic report. */
+    public static final Instant DETERMINISTIC_EPOCH = Instant.EPOCH;
+
     private final String reportVersion;
     private final String baselineVersion;
     private final String currentVersion;
@@ -24,7 +32,7 @@ public final class CompatReport {
         this.reportVersion = reportVersion;
         this.baselineVersion = baselineVersion;
         this.currentVersion = currentVersion;
-        this.generatedAt = generatedAt;
+        this.generatedAt = generatedAt == null ? DETERMINISTIC_EPOCH : generatedAt;
         this.changes = List.copyOf(changes);
     }
 

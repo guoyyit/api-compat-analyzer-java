@@ -89,7 +89,7 @@ public class JavaSourceParser implements SourceParser {
             }
         });
         return new ParsedUnit(file, ctx.elements, ctx.callSites, ctx.referencedTypes,
-                ctx.declaredTypes, ctx.suppressedKeys, ctx.supertypes);
+                ctx.declaredTypes, ctx.suppressedKeys, ctx.supertypes, ctx.superClasses);
     }
 
     // ------------------------------------------------------------------
@@ -103,6 +103,7 @@ public class JavaSourceParser implements SourceParser {
         final Map<String, String> staticImports = new HashMap<>();  // member name -> owner fqn
         final Map<String, String> declaredSimple = new HashMap<>(); // simple -> fqn (this file)
         final Map<String, String> superOf = new HashMap<>();        // type fqn -> supertype name
+        final Map<String, String> superClasses = new HashMap<>();  // class fqn -> resolved superclass fqn
         final Map<String, List<String>> supertypes = new HashMap<>(); // type fqn -> resolved supertypes
         final Map<String, String> fieldTypes = new HashMap<>();     // field name -> type (this file)
         final List<ApiElement> elements = new ArrayList<>();
@@ -174,8 +175,14 @@ public class JavaSourceParser implements SourceParser {
             var coi = td.asClassOrInterfaceDeclaration();
             coi.getExtendedTypes().forEach(t -> supers.add(ctx.resolveType(t.getNameAsString())));
             coi.getImplementedTypes().forEach(t -> supers.add(ctx.resolveType(t.getNameAsString())));
-            if (!coi.isInterface() && !coi.getExtendedTypes().isEmpty()) {
-                ctx.superOf.put(fqn, coi.getExtendedTypes().get(0).getNameAsString());
+            if (!coi.isInterface()) {
+                // Every class gets an entry; empty string means an implicit direct superclass.
+                String resolvedSuper = coi.getExtendedTypes().isEmpty()
+                        ? "" : ctx.resolveType(coi.getExtendedTypes().get(0).getNameAsString());
+                ctx.superClasses.put(fqn, resolvedSuper);
+                if (!coi.getExtendedTypes().isEmpty()) {
+                    ctx.superOf.put(fqn, coi.getExtendedTypes().get(0).getNameAsString());
+                }
             }
         } else if (td.isEnumDeclaration()) {
             td.asEnumDeclaration().getImplementedTypes()
@@ -247,8 +254,15 @@ public class JavaSourceParser implements SourceParser {
             }
             List<String> params = md.getParameters().stream()
                     .map(p -> normalizeType(p.getTypeAsString())).toList();
+            Set<String> methodMods = modifiersOf(md);
+            if (implicitPublic && isInterfaceType(owner)
+                    && !methodMods.contains("default") && !methodMods.contains("static")) {
+                // Interface methods without default/static are implicitly abstract.
+                methodMods = new LinkedHashSet<>(methodMods);
+                methodMods.add("abstract");
+            }
             ApiElement e = new ApiElement(ElementKind.METHOD, ownerFqn, md.getNameAsString(),
-                    normalizeType(md.getTypeAsString()), params, access, modifiersOf(md),
+                    normalizeType(md.getTypeAsString()), params, access, methodMods,
                     ctx.file, lineOf(md));
             ctx.elements.add(e);
             if (ownerIgnored || isIgnored(md)) {

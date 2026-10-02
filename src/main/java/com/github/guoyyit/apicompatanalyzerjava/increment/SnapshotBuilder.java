@@ -42,6 +42,7 @@ public final class SnapshotBuilder {
         Map<String, ApiElement> elements = new LinkedHashMap<>();
         Map<String, List<CallSite>> refs = new HashMap<>();
         Map<String, List<String>> supertypes = new HashMap<>();
+        Map<String, String> superclasses = new HashMap<>();
         Map<String, String> typeToFile = new HashMap<>();
         Map<String, List<String>> simpleNameToFiles = new HashMap<>();
 
@@ -53,6 +54,7 @@ public final class SnapshotBuilder {
                 refs.computeIfAbsent(cs.referencedKey(), k -> new ArrayList<>()).add(cs);
             }
             supertypes.putAll(unit.typeSupertypes());
+            superclasses.putAll(unit.typeSuperclasses());
             for (String declared : unit.declaredTypes()) {
                 typeToFile.putIfAbsent(declared, unit.file());
                 String simple = declared.substring(declared.lastIndexOf('.') + 1);
@@ -80,7 +82,7 @@ public final class SnapshotBuilder {
             deps.put(unit.file(), fileDeps);
         }
 
-        return new ApiSnapshot(version, elements, refs, fileHashes, deps);
+        return new ApiSnapshot(version, elements, refs, fileHashes, deps, supertypes, superclasses);
     }
 
     /**
@@ -151,6 +153,9 @@ public final class SnapshotBuilder {
                 if (parent.kind() == ElementKind.CONSTRUCTOR || parent.access() == AccessLevel.PRIVATE) {
                     continue;
                 }
+                if (parent.modifiers().contains("static") && isInterface(elements, superType)) {
+                    continue; // interface static methods are never inherited
+                }
                 if (parent.kind() == ElementKind.METHOD
                         && ownMethodSigs.contains(parent.name() + "(" + String.join(",", parent.parameterTypes()) + ")")) {
                     continue; // overridden
@@ -183,5 +188,10 @@ public final class SnapshotBuilder {
             }
         }
         return result;
+    }
+
+    private static boolean isInterface(Map<String, ApiElement> elements, String typeFqn) {
+        ApiElement typeElement = elements.get("TYPE:" + typeFqn);
+        return typeElement != null && "INTERFACE".equals(typeElement.returnType());
     }
 }
