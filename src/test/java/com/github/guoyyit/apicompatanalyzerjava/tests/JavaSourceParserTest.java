@@ -71,11 +71,51 @@ class JavaSourceParserTest {
         ParsedUnit unit = parser.parse("Child.java", Fixtures.CHILD);
         assertThat(unit.typeSupertypes())
                 .containsEntry("com.example.Child", List.of("com.example.Base"));
+        assertThat(unit.typeSuperclasses())
+                .containsEntry("com.example.Child", "com.example.Base");
         assertThat(unit.referencedTypes()).contains("com.example.Base");
         assertThat(unit.declaredTypes()).contains("com.example.Child");
         assertThat(unit.callSites())
                 .extracting(CallSite::referencedKey)
                 .contains("TYPE:com.example.Base");
+    }
+
+    @Test
+    void recordsSuperclassInterfacesAndAbstractness() {
+        String source = """
+                package com.example;
+                public class Impl extends Base implements Repository {
+                }
+                """;
+        ParsedUnit unit = parser.parse("Impl.java", source);
+        assertThat(unit.typeSuperclasses()).containsEntry("com.example.Impl", "com.example.Base");
+        assertThat(unit.typeInterfaces()).containsEntry("com.example.Impl", List.of("com.example.Repository"));
+        assertThat(unit.abstractTypes()).doesNotContain("com.example.Impl");
+
+        ParsedUnit iface = parser.parse("Repository.java", Fixtures.REPO_V1);
+        assertThat(iface.abstractTypes()).contains("com.example.Repository");
+        assertThat(iface.typeSuperclasses()).doesNotContainKey("com.example.Repository");
+        assertThat(iface.typeInterfaces())
+                .doesNotContainKey("com.example.Repository");
+
+        ParsedUnit abs = parser.parse("Shape.java", Fixtures.SHAPE_V1);
+        assertThat(abs.abstractTypes()).doesNotContain("com.example.Shape");
+    }
+
+    @Test
+    void interfaceAbstractMethodsAreFlaggedDefaultMethodsAreNot() {
+        ParsedUnit abstractIface = parser.parse("Repository.java", Fixtures.REPO_V2_ABSTRACT);
+        ApiElement save = abstractIface.apiElements().stream()
+                .filter(el -> el.key().equals("METHOD:com.example.Repository#save()"))
+                .findFirst().orElseThrow();
+        assertThat(save.modifiers()).contains("abstract");
+
+        ParsedUnit defaultIface = parser.parse("RepositoryDefault.java", Fixtures.REPO_V2_DEFAULT);
+        ApiElement defaultSave = defaultIface.apiElements().stream()
+                .filter(el -> el.key().equals("METHOD:com.example.Repository#save()"))
+                .findFirst().orElseThrow();
+        assertThat(defaultSave.modifiers()).contains("default");
+        assertThat(defaultSave.modifiers()).doesNotContain("abstract");
     }
 
     @Test

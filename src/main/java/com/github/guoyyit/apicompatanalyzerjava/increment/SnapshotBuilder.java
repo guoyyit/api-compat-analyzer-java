@@ -5,6 +5,7 @@ import com.github.guoyyit.apicompatanalyzerjava.model.ApiElement;
 import com.github.guoyyit.apicompatanalyzerjava.model.ApiSnapshot;
 import com.github.guoyyit.apicompatanalyzerjava.model.CallSite;
 import com.github.guoyyit.apicompatanalyzerjava.model.ElementKind;
+import com.github.guoyyit.apicompatanalyzerjava.model.TypeRelation;
 import com.github.guoyyit.apicompatanalyzerjava.parse.ParsedUnit;
 
 import java.util.ArrayList;
@@ -44,6 +45,7 @@ public final class SnapshotBuilder {
         Map<String, List<String>> supertypes = new HashMap<>();
         Map<String, String> typeToFile = new HashMap<>();
         Map<String, List<String>> simpleNameToFiles = new HashMap<>();
+        Map<String, TypeRelation> typeHierarchy = new LinkedHashMap<>();
 
         for (ParsedUnit unit : sorted) {
             for (ApiElement el : unit.apiElements()) {
@@ -53,6 +55,13 @@ public final class SnapshotBuilder {
                 refs.computeIfAbsent(cs.referencedKey(), k -> new ArrayList<>()).add(cs);
             }
             supertypes.putAll(unit.typeSupertypes());
+            for (String declared : unit.declaredTypes()) {
+                String superclass = unit.typeSuperclasses().getOrDefault(declared, "");
+                List<String> interfaces = unit.typeInterfaces().getOrDefault(declared, List.of());
+                boolean concrete = !unit.abstractTypes().contains(declared);
+                typeHierarchy.putIfAbsent(declared,
+                        new TypeRelation(concrete, superclass, interfaces));
+            }
             for (String declared : unit.declaredTypes()) {
                 typeToFile.putIfAbsent(declared, unit.file());
                 String simple = declared.substring(declared.lastIndexOf('.') + 1);
@@ -80,7 +89,7 @@ public final class SnapshotBuilder {
             deps.put(unit.file(), fileDeps);
         }
 
-        return new ApiSnapshot(version, elements, refs, fileHashes, deps);
+        return new ApiSnapshot(version, elements, refs, fileHashes, deps, typeHierarchy);
     }
 
     /**

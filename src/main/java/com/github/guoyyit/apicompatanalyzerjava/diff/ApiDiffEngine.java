@@ -7,10 +7,14 @@ import com.github.guoyyit.apicompatanalyzerjava.model.ApiSnapshot;
 import com.github.guoyyit.apicompatanalyzerjava.model.CallSite;
 import com.github.guoyyit.apicompatanalyzerjava.model.ChangeKind;
 import com.github.guoyyit.apicompatanalyzerjava.model.ElementKind;
+import com.github.guoyyit.apicompatanalyzerjava.model.TypeRelation;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Deque;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -47,10 +51,10 @@ public class ApiDiffEngine {
         }
         for (ApiElement newEl : newElements.values()) {
             if (!oldElements.containsKey(newEl.key())) {
-                changes.add(change(ChangeKind.ADDED, false, newEl,
-                        describe(newEl) + " was added", "", detailOf(newEl), List.of()));
+                handleAddedElement(newEl, baseline, current, changes);
             }
         }
+        detectSuperclassChanges(baseline, current, changes);
 
         changes.sort(Comparator.comparing(ApiChange::elementKey).thenComparing(c -> c.kind().ordinal()));
 
@@ -61,6 +65,150 @@ public class ApiDiffEngine {
                     c.oldDetail(), c.newDetail(), c.affectedCallSites(), suppressed));
         }
         return result;
+    }
+
+    /**
+     * Classifies a newly appearing element. Ordinary additions are compatible,
+     * but a new abstract method (an abstract class/interface method without a
+     * default implementation) is breaking: every concrete downstream type that
+     * inherits it without providing an implementation fails to compile.
+     * A method on a newly added type is always compatible, since the type itself
+     * did not exist in the baseline.
+     */
+    private void handleAddedElement(ApiElement newEl, ApiSnapshot baseline, ApiSnapshot current,
+                                    List<ApiChange> changes) {
+        boolean ownerExistedInBaseline =
+                baseline.elements().containsKey("TYPE:" + newEl.ownerType());
+        if (newEl.kind() == ElementKind.METHOD && newEl.modifiers().contains("abstract")
+                && ownerExistedInBaseline) {
+            List<CallSite> sites = abstractMethodImpact(newEl.ownerType(), newEl, current);
+            changes.add(change(ChangeKind.ADDED, true, newEl,
+                    describe(newEl) + " was added as an abstract method; concrete implementors must implement it",
+                    "", detailOf(newEl), sites));
+            return;
+        }
+        changes.add(change(ChangeKind.ADDED, false, newEl,
+                describe(newEl) + " was added", "", detailOf(newEl), List.of()));
+    }
+
+    /**
+     * Locates concrete downstream types that inherit the newly added abstract
+     * method without implementing it, and returns their declaration and usage
+     * sites (file, line, column and hit symbol).
+     */
+    private static List<CallSite> abstractMethodImpact(String ownerFqn, ApiElement method,
+                                                       ApiSnapshot current) {
+        Map<String, TypeRelation> hierarchy = current.typeHierarchy();
+        Map<String, ApiElement> elements = current.elements();
+        String params = "(" + String.join(",", method.parameterTypes()) + ")";
+        Set<CallSite> result = new LinkedHashSet<>();
+
+        // Declaration and usage sites of the declaring type itself: TYPE
+        // references plus calls to this very method (polymorphic calls through
+        // an interface-typed reference are attributed to the interface).
+        collectOwnerMethodSites(ownerFqn, method, current.referencesByKey(), result);
+        addDeclarationSite(ownerFqn, current, result);
+
+        // Plus concrete descendants that still inherit the method as abstract.
+        for (String descendant : descendants(ownerFqn, hierarchy, false)) {
+            TypeRelation rel = hierarchy.get(descendant);
+            if (rel != null && rel.concrete()
+                    && isAbstractAt(descendant, method.name(), params, elements)) {
+                collectTypeSites(descendant, current.referencesByKey(), result);
+                addDeclarationSite(descendant, current, result);
+            }
+        }
+        return sortSites(result);
+    }
+
+    /** True when the effective method at {@code type} is abstract (no concrete implementation in place). */
+    private static boolean isAbstractAt(String type, String methodName, String params,
+                                        Map<String, ApiElement> elements) {
+        ApiElement effective = elements.get("METHOD:" + type + "#" + methodName + params);
+        return effective != null && effective.modifiers().contains("abstract");
+    }
+
+    /**
+     * A direct superclass replacement, removal or addition changes the type's
+     * contract (inherited members and behaviour change); it is always breaking
+     * and affects the type itself and every subclass together with their usage
+     * sites.
+     */
+    private static void detectSuperclassChanges(ApiSnapshot baseline, ApiSnapshot current,
+                                                List<ApiChange> changes) {
+        Map<String, TypeRelation> oldHierarchy = baseline.typeHierarchy();
+        Map<String, TypeRelation> newHierarchy = current.typeHierarchy();
+        if (oldHierarchy.isEmpty()) {
+            return; // baseline persisted before hierarchy tracking: nothing comparable
+        }
+        Set<String> types = new TreeSet<>();
+        types.addAll(oldHierarchy.keySet());
+        types.addAll(newHierarchy.keySet());
+        for (String type : types) {
+            TypeRelation oldRel = oldHierarchy.get(type);
+            TypeRelation newRel = newHierarchy.get(type);
+            if (oldRel == null || newRel == null) {
+                continue; // type addition/removal is reported separately
+            }
+            String oldSuper = oldRel.superclass();
+            String newSuper = newRel.superclass();
+            if (oldSuper.equals(newSuper)) {
+                continue;
+            }
+            Set<CallSite> sites = new LinkedHashSet<>();
+            collectTypeSites(type, current.referencesByKey(), sites);
+            addDeclarationSite(type, current, sites);
+            for (String subclass : descendants(type, newHierarchy, true)) {
+                collectTypeSites(subclass, current.referencesByKey(), sites);
+                addDeclarationSite(subclass, current, sites);
+            }
+            String description = "Type " + type + " superclass changed from "
+                    + (oldSuper.isEmpty() ? "(none)" : oldSuper)
+                    + " to " + (newSuper.isEmpty() ? "(none)" : newSuper);
+            ApiElement placeholder = new ApiElement(ElementKind.TYPE, "", type,
+                    "CLASS", List.of(), AccessLevel.PUBLIC, Set.of(), "", -1);
+            changes.add(new ApiChange(ChangeKind.SUPERCLASS_CHANGED, true, placeholder.key(),
+                    description, oldSuper, newSuper, sortSites(sites)));
+        }
+    }
+
+    /**
+     * Types directly/transitively derived from {@code root} through the
+     * hierarchy. When {@code classEdgesOnly} is set only {@code extends} edges
+     * are followed (subclass impact of a superclass change).
+     */
+    static List<String> descendants(String root, Map<String, TypeRelation> hierarchy,
+                                    boolean classEdgesOnly) {
+        Map<String, List<String>> children = new HashMap<>();
+        for (Map.Entry<String, TypeRelation> e : hierarchy.entrySet()) {
+            String child = e.getKey();
+            if (!e.getValue().superclass().isEmpty()) {
+                children.computeIfAbsent(e.getValue().superclass(), k -> new ArrayList<>()).add(child);
+            }
+            if (!classEdgesOnly) {
+                for (String itf : e.getValue().interfaces()) {
+                    children.computeIfAbsent(itf, k -> new ArrayList<>()).add(child);
+                }
+            }
+        }
+        List<String> result = new ArrayList<>();
+        Deque<String> queue = new ArrayDeque<>(children.getOrDefault(root, List.of()));
+        Set<String> seen = new LinkedHashSet<>();
+        while (!queue.isEmpty()) {
+            String next = queue.removeFirst();
+            if (seen.add(next)) {
+                result.add(next);
+                queue.addAll(children.getOrDefault(next, List.of()));
+            }
+        }
+        return result;
+    }
+
+    private static List<CallSite> sortSites(Set<CallSite> sites) {
+        List<CallSite> sorted = new ArrayList<>(sites);
+        sorted.sort(Comparator.comparing(CallSite::file).thenComparingInt(CallSite::line)
+                .thenComparingInt(CallSite::column).thenComparing(CallSite::referencedKey));
+        return sorted;
     }
 
     private void compareElement(ApiElement oldEl, ApiElement newEl, ApiSnapshot current,
@@ -134,15 +282,7 @@ public class ApiDiffEngine {
         Set<CallSite> result = new LinkedHashSet<>();
         switch (element.kind()) {
             case TYPE -> {
-                String fqn = element.name();
-                collect(refs, "TYPE:" + fqn, result);
-                String memberPrefix = "MEMBER:" + fqn + "#";
-                String fieldPrefix = "FIELD:" + fqn + "#";
-                refs.forEach((key, sites) -> {
-                    if (key.startsWith(memberPrefix) || key.startsWith(fieldPrefix)) {
-                        result.addAll(sites);
-                    }
-                });
+                collectTypeSites(element.name(), refs, result);
             }
             case FIELD -> {
                 collect(refs, "FIELD:" + element.ownerType() + "#" + element.name(), result);
@@ -161,9 +301,42 @@ public class ApiDiffEngine {
             }
         }
         List<CallSite> sorted = new ArrayList<>(result);
-        sorted.sort(Comparator.comparing(CallSite::file).thenComparingInt(CallSite::line)
-                .thenComparingInt(CallSite::column));
-        return sorted;
+        return sortSites(result);
+    }
+
+    /** Collects all declaration and usage sites of a type (TYPE/FIELD/MEMBER references). */
+    static void collectTypeSites(String fqn, Map<String, List<CallSite>> refs, Set<CallSite> out) {
+        collect(refs, "TYPE:" + fqn, out);
+        String memberPrefix = "MEMBER:" + fqn + "#";
+        String fieldPrefix = "FIELD:" + fqn + "#";
+        refs.forEach((key, sites) -> {
+            if (key.startsWith(memberPrefix) || key.startsWith(fieldPrefix)) {
+                out.addAll(sites);
+            }
+        });
+    }
+
+    /** Synthesizes the type's own declaration site (file/line, hit symbol = the type FQN). */
+    private static void addDeclarationSite(String fqn, ApiSnapshot current, Set<CallSite> out) {
+        ApiElement typeElement = current.elements().get("TYPE:" + fqn);
+        if (typeElement != null && typeElement.line() > 0) {
+            out.add(new CallSite(typeElement.sourceFile(), typeElement.line(), 1,
+                    fqn, "TYPE:" + fqn));
+        }
+    }
+
+    /** TYPE references of a type plus MEMBER references matching the given method's name/arity. */
+    private static void collectOwnerMethodSites(String fqn, ApiElement method,
+                                                Map<String, List<CallSite>> refs,
+                                                Set<CallSite> out) {
+        collect(refs, "TYPE:" + fqn, out);
+        int arity = method.parameterTypes().size();
+        String prefix = "MEMBER:" + fqn + "#" + method.name() + "/";
+        refs.forEach((key, sites) -> {
+            if (key.startsWith(prefix) && arityMatches(key, arity)) {
+                out.addAll(sites);
+            }
+        });
     }
 
     private static boolean arityMatches(String key, int arity) {

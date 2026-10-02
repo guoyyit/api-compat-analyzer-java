@@ -13,6 +13,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.assertj.core.api.Assertions.assertThat;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -68,6 +69,33 @@ class AnalysisControllerTest {
                         .contentType(MediaType.APPLICATION_JSON).content(incremental))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.currentVersion", is("2.0")));
+    }
+
+    @Test
+    void repeatedFullAnalysesReturnTheSameDeterministicReportId() throws Exception {
+        String baseline = """
+                {"version": "1.0", "sources": {"Service.java": %s}}
+                """.formatted(json(Fixtures.SERVICE_V1));
+        mockMvc.perform(post("/api/analysis/baseline")
+                        .contentType(MediaType.APPLICATION_JSON).content(baseline))
+                .andExpect(status().isOk());
+
+        String full = """
+                {"version": "2.0", "sources": {"Service.java": %s, "Caller.java": %s}}
+                """.formatted(json(Fixtures.SERVICE_V2), json(Fixtures.CALLER));
+        String firstId = postFullAndExtractId(full);
+        String secondId = postFullAndExtractId(full);
+        assertThat(firstId).isNotBlank();
+        assertThat(secondId).isEqualTo(firstId);
+    }
+
+    private String postFullAndExtractId(String body) throws Exception {
+        String response = mockMvc.perform(post("/api/analysis/full")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        return new com.fasterxml.jackson.databind.ObjectMapper()
+                .readTree(response).get("reportVersion").asText();
     }
 
     /** Produces a JSON string literal for the given Java source. */

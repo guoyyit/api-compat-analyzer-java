@@ -89,7 +89,8 @@ public class JavaSourceParser implements SourceParser {
             }
         });
         return new ParsedUnit(file, ctx.elements, ctx.callSites, ctx.referencedTypes,
-                ctx.declaredTypes, ctx.suppressedKeys, ctx.supertypes);
+                ctx.declaredTypes, ctx.suppressedKeys, ctx.supertypes,
+                ctx.superclasses, ctx.interfaces, ctx.abstractTypes);
     }
 
     // ------------------------------------------------------------------
@@ -104,6 +105,9 @@ public class JavaSourceParser implements SourceParser {
         final Map<String, String> declaredSimple = new HashMap<>(); // simple -> fqn (this file)
         final Map<String, String> superOf = new HashMap<>();        // type fqn -> supertype name
         final Map<String, List<String>> supertypes = new HashMap<>(); // type fqn -> resolved supertypes
+        final Map<String, String> superclasses = new HashMap<>();  // type fqn -> resolved superclass
+        final Map<String, List<String>> interfaces = new HashMap<>(); // type fqn -> resolved interfaces
+        final Set<String> abstractTypes = new LinkedHashSet<>();   // abstract or interface types
         final Map<String, String> fieldTypes = new HashMap<>();     // field name -> type (this file)
         final List<ApiElement> elements = new ArrayList<>();
         final List<CallSite> callSites = new ArrayList<>();
@@ -170,18 +174,32 @@ public class JavaSourceParser implements SourceParser {
         boolean ignored = enclosingIgnored || isIgnored(td);
 
         List<String> supers = new ArrayList<>();
+        List<String> interfaceNames = new ArrayList<>();
+        String superclassName = "";
         if (td.isClassOrInterfaceDeclaration()) {
             var coi = td.asClassOrInterfaceDeclaration();
-            coi.getExtendedTypes().forEach(t -> supers.add(ctx.resolveType(t.getNameAsString())));
-            coi.getImplementedTypes().forEach(t -> supers.add(ctx.resolveType(t.getNameAsString())));
-            if (!coi.isInterface() && !coi.getExtendedTypes().isEmpty()) {
-                ctx.superOf.put(fqn, coi.getExtendedTypes().get(0).getNameAsString());
+            if (coi.isInterface()) {
+                coi.getExtendedTypes().forEach(t ->
+                        interfaceNames.add(ctx.resolveType(t.getNameAsString())));
+                supers.addAll(interfaceNames);
+            } else {
+                if (!coi.getExtendedTypes().isEmpty()) {
+                    superclassName = ctx.resolveType(coi.getExtendedTypes(0).getNameAsString());
+                    supers.add(superclassName);
+                    ctx.superOf.put(fqn, coi.getExtendedTypes(0).getNameAsString());
+                }
+                coi.getImplementedTypes().forEach(t ->
+                        interfaceNames.add(ctx.resolveType(t.getNameAsString())));
+                supers.addAll(interfaceNames);
             }
         } else if (td.isEnumDeclaration()) {
-            td.asEnumDeclaration().getImplementedTypes()
-                    .forEach(t -> supers.add(ctx.resolveType(t.getNameAsString())));
+            td.asEnumDeclaration().getImplementedTypes().forEach(t ->
+                    interfaceNames.add(ctx.resolveType(t.getNameAsString())));
+            supers.addAll(interfaceNames);
         } else if (td instanceof RecordDeclaration rd) {
-            rd.getImplementedTypes().forEach(t -> supers.add(ctx.resolveType(t.getNameAsString())));
+            rd.getImplementedTypes().forEach(t ->
+                    interfaceNames.add(ctx.resolveType(t.getNameAsString())));
+            supers.addAll(interfaceNames);
         }
         if (!supers.isEmpty()) {
             ctx.supertypes.put(fqn, supers);
@@ -189,6 +207,17 @@ public class JavaSourceParser implements SourceParser {
                 ctx.referencedTypes.add(sup);
                 addCallSite(td, "TYPE:" + sup, fqn, ctx);
             }
+        }
+        if (!superclassName.isEmpty()) {
+            ctx.superclasses.put(fqn, superclassName);
+        }
+        if (!interfaceNames.isEmpty()) {
+            ctx.interfaces.put(fqn, List.copyOf(interfaceNames));
+        }
+        if (isInterfaceType(td)
+                || (td.isClassOrInterfaceDeclaration()
+                && td.asClassOrInterfaceDeclaration().isAbstract())) {
+            ctx.abstractTypes.add(fqn);
         }
 
         {
@@ -247,8 +276,15 @@ public class JavaSourceParser implements SourceParser {
             }
             List<String> params = md.getParameters().stream()
                     .map(p -> normalizeType(p.getTypeAsString())).toList();
+            Set<String> mods = modifiersOf(md);
+            // Non-static, non-default interface methods are implicitly abstract;
+            // recording this keeps "new abstract interface method" detectable.
+            if (isInterfaceType(owner) && !mods.contains("static") && !mods.contains("default")) {
+                mods = new LinkedHashSet<>(mods);
+                mods.add("abstract");
+            }
             ApiElement e = new ApiElement(ElementKind.METHOD, ownerFqn, md.getNameAsString(),
-                    normalizeType(md.getTypeAsString()), params, access, modifiersOf(md),
+                    normalizeType(md.getTypeAsString()), params, access, mods,
                     ctx.file, lineOf(md));
             ctx.elements.add(e);
             if (ownerIgnored || isIgnored(md)) {

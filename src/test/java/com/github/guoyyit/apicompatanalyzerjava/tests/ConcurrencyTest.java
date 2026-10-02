@@ -7,9 +7,11 @@ import com.github.guoyyit.apicompatanalyzerjava.model.CompatReport;
 import com.github.guoyyit.apicompatanalyzerjava.parse.JavaSourceParser;
 import com.github.guoyyit.apicompatanalyzerjava.service.AnalysisService;
 import com.github.guoyyit.apicompatanalyzerjava.suppress.SuppressionStore;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -24,6 +26,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Requirement 6: concurrent analysis/update requests never expose mixed versions. */
 class ConcurrencyTest {
+
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private AnalysisService newService() {
         return new AnalysisService(new JavaSourceParser(), new ApiDiffEngine(),
@@ -109,7 +113,7 @@ class ConcurrencyTest {
             CompatReport report = f.get(60, TimeUnit.SECONDS);
             // Each returned report is a complete, self-consistent object.
             assertThat(report.reportVersion()).isNotBlank();
-            assertThat(report.generatedAt()).isNotNull();
+            assertThat(report.reportVersion()).startsWith("report-");
         }
         pool.shutdownNow();
 
@@ -149,6 +153,40 @@ class ConcurrencyTest {
         CompatReport report = service.currentReport().orElseThrow();
         assertThat(report.currentVersion()).isEqualTo(service.currentSnapshot().version());
         assertThat(report.changes()).isEmpty(); // identical trees
+    }
+
+    @Test
+    void concurrentIdenticalAnalysesAllReturnTheSamePublishedReport() throws Exception {
+        AnalysisService service = newService();
+        service.setBaseline(Map.of("Service.java", Fixtures.SERVICE_V1), "1.0");
+
+        int writers = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(writers);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<CompatReport>> futures = new ArrayList<>();
+        for (int i = 0; i < writers; i++) {
+            futures.add(pool.submit(() -> {
+                await(start);
+                return service.analyzeFull(
+                        Map.of("Service.java", Fixtures.SERVICE_V2,
+                                "Caller.java", Fixtures.CALLER), "2.0");
+            }));
+        }
+        start.countDown();
+
+        Set<String> returnedReports = new HashSet<>();
+        for (Future<CompatReport> f : futures) {
+            CompatReport report = f.get(60, TimeUnit.SECONDS);
+            returnedReports.add(JSON.writeValueAsString(report));
+        }
+        pool.shutdownNow();
+
+        assertThat(returnedReports).hasSize(1);
+        CompatReport finalReport = service.currentReport().orElseThrow();
+        assertThat(JSON.writeValueAsString(finalReport))
+                .isEqualTo(returnedReports.iterator().next());
+        assertThat(finalReport.currentVersion())
+                .isEqualTo(service.currentSnapshot().version());
     }
 
     private static void await(CountDownLatch latch) {

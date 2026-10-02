@@ -5,6 +5,7 @@ import com.github.guoyyit.apicompatanalyzerjava.model.AccessLevel;
 import com.github.guoyyit.apicompatanalyzerjava.model.ApiElement;
 import com.github.guoyyit.apicompatanalyzerjava.model.ApiSnapshot;
 import com.github.guoyyit.apicompatanalyzerjava.model.ElementKind;
+import com.github.guoyyit.apicompatanalyzerjava.model.TypeRelation;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -31,7 +32,12 @@ public class BaselineStore {
                       String sourceFile, int line) {
     }
 
-    record BaselineDto(String version, Set<String> suppressedKeys, List<ElementDto> elements) {
+    record RelationDto(boolean concrete, String superclass, List<String> interfaces) {
+    }
+
+    record BaselineDto(String version, Set<String> suppressedKeys, List<ElementDto> elements,
+                       Map<String, String> fileHashes,
+                       Map<String, RelationDto> typeHierarchy) {
     }
 
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -42,7 +48,11 @@ public class BaselineStore {
                         el.returnType(), el.parameterTypes(), el.access().name(),
                         el.modifiers(), el.sourceFile(), el.line()))
                 .toList();
-        BaselineDto dto = new BaselineDto(snapshot.version(), suppressedKeys, elements);
+        Map<String, RelationDto> hierarchy = new LinkedHashMap<>();
+        snapshot.typeHierarchy().forEach((type, rel) ->
+                hierarchy.put(type, new RelationDto(rel.concrete(), rel.superclass(), rel.interfaces())));
+        BaselineDto dto = new BaselineDto(snapshot.version(), suppressedKeys, elements,
+                snapshot.fileHashes(), hierarchy);
         try {
             objectMapper.writerWithDefaultPrettyPrinter().writeValue(file.toFile(), dto);
         } catch (IOException e) {
@@ -66,7 +76,19 @@ public class BaselineStore {
                     d.sourceFile(), d.line());
             elements.putIfAbsent(el.key(), el);
         }
-        ApiSnapshot snapshot = new ApiSnapshot(dto.version(), elements, Map.of(), Map.of(), Map.of());
+        Map<String, String> fileHashes = dto.fileHashes() == null
+                ? Map.of() : new LinkedHashMap<>(dto.fileHashes());
+        Map<String, TypeRelation> hierarchy = new LinkedHashMap<>();
+        if (dto.typeHierarchy() != null) {
+            dto.typeHierarchy().forEach((type, rel) -> {
+                if (rel != null) {
+                    hierarchy.put(type, new TypeRelation(rel.concrete(), rel.superclass(),
+                            rel.interfaces() == null ? List.of() : rel.interfaces()));
+                }
+            });
+        }
+        ApiSnapshot snapshot = new ApiSnapshot(dto.version(), elements, Map.of(),
+                fileHashes, Map.of(), hierarchy);
         Set<String> suppressed = dto.suppressedKeys() == null ? Set.of() : dto.suppressedKeys();
         return new BaselineData(snapshot, suppressed);
     }

@@ -16,10 +16,9 @@ import org.springframework.stereotype.Service;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.time.Instant;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.TreeMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -31,7 +30,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -40,12 +38,21 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <p>Concurrency model: updates (full/incremental/baseline changes) are
  * serialized through an update lock; the resulting immutable report is
- * published through an {@link AtomicReference} only after it is complete,
- * so concurrent readers always observe exactly one consistent version.
+ * published together with its snapshot and cached working state as one
+ * immutable state object through an {@link AtomicReference}, only after the
+ * analysis is complete. Concurrent readers therefore always observe exactly
+ * one fully published (report + version info) pair and never a generation in
+ * progress.
+ *
+ * <p>Determinism: reports contain no wall-clock or process-state data. The
+ * report id is a hash of the complete baseline and current input contents
+ * (per-file content hashes plus version labels); identical inputs produce
+ * identical reports on every run and after a service restart.
  *
  * <p>Bounds: every run executes on a bounded executor with a wall-clock
- * timeout and input-size limits. On timeout or limit violation nothing is
- * published, so no half-finished report is ever visible.
+ * timeout and input-size limits. On timeout or limit violation the state
+ * object is not replaced, so no partial result is published and the previous
+ * report stays intact and readable.
  */
 @Service
 public class AnalysisService {
@@ -57,20 +64,33 @@ public class AnalysisService {
     private final AnalysisProperties properties;
     private final ExecutorService executor;
 
-    private final AtomicReference<ApiSnapshot> baseline =
-            new AtomicReference<>(ApiSnapshot.empty("none"));
-    private final AtomicReference<ApiSnapshot> current =
-            new AtomicReference<>(ApiSnapshot.empty("none"));
-    private final AtomicReference<CompatReport> report = new AtomicReference<>();
-    private final AtomicLong reportSequence = new AtomicLong();
+    /**
+     * Immutable published state: baseline snapshot, current snapshot, the
+     * report comparing them and the cached working data of the current tree.
+     * Replaced atomically as a whole on every successful update.
+     */
+    private record AnalysisState(ApiSnapshot baselineSnapshot, Set<String> baselineSuppressions,
+                                 ApiSnapshot currentSnapshot, CompatReport report,
+                                 Map<String, String> currentSources,
+                                 Map<String, ParsedUnit> currentUnits,
+                                 Map<String, String> currentHashes) {
+        AnalysisState {
+            baselineSuppressions = Set.copyOf(baselineSuppressions);
+            currentSources = Map.copyOf(currentSources);
+            currentUnits = Map.copyOf(currentUnits);
+            currentHashes = Map.copyOf(currentHashes);
+        }
+
+        static AnalysisState initial() {
+            return new AnalysisState(ApiSnapshot.empty("none"), Set.of(),
+                    ApiSnapshot.empty("none"), null, Map.of(), Map.of(), Map.of());
+        }
+    }
+
+    private final AtomicReference<AnalysisState> state =
+            new AtomicReference<>(AnalysisState.initial());
 
     private final ReentrantLock updateLock = new ReentrantLock();
-
-    // Working state for incremental updates. Guarded by updateLock.
-    private final Map<String, String> currentSources = new HashMap<>();
-    private final Map<String, ParsedUnit> currentUnits = new HashMap<>();
-    private final Map<String, String> currentHashes = new HashMap<>();
-    private final Set<String> baselineSuppressions = new HashSet<>();
 
     public AnalysisService(SourceParser parser, ApiDiffEngine diffEngine,
                            IncrementalAnalyzer incrementalAnalyzer,
@@ -90,13 +110,14 @@ public class AnalysisService {
         return runBounded(() -> {
             updateLock.lock();
             try {
+                AnalysisState st = state.get();
                 Map<String, ParsedUnit> units = new LinkedHashMap<>();
-                for (Map.Entry<String, String> e : sources.entrySet()) {
+                for (Map.Entry<String, String> e : new TreeMap<>(sources).entrySet()) {
                     units.put(e.getKey(), parser.parse(e.getKey(), e.getValue()));
                 }
                 Map<String, String> hashes = hashes(sources);
                 ApiSnapshot snapshot = SnapshotBuilder.build(currentVersion, units.values(), hashes);
-                return publish(snapshot, units, sources, hashes);
+                return publish(st, snapshot, sources, units, hashes);
             } finally {
                 updateLock.unlock();
             }
@@ -114,14 +135,15 @@ public class AnalysisService {
         return runBounded(() -> {
             updateLock.lock();
             try {
-                Map<String, String> newSources = new HashMap<>(currentSources);
+                AnalysisState st = state.get();
+                Map<String, String> newSources = new LinkedHashMap<>(st.currentSources());
                 deletedFiles.forEach(newSources::remove);
                 newSources.putAll(changedSources);
                 checkBounds(newSources);
                 Map<String, String> newHashes = hashes(newSources);
 
-                Set<String> dirty = incrementalAnalyzer.dirtyFiles(current.get(), newHashes);
-                Map<String, ParsedUnit> units = new LinkedHashMap<>(currentUnits);
+                Set<String> dirty = incrementalAnalyzer.dirtyFiles(st.currentSnapshot(), newHashes);
+                Map<String, ParsedUnit> units = new LinkedHashMap<>(st.currentUnits());
                 units.keySet().removeIf(file -> !newSources.containsKey(file));
                 for (String file : dirty) {
                     String source = newSources.get(file);
@@ -132,7 +154,7 @@ public class AnalysisService {
                     }
                 }
                 ApiSnapshot snapshot = SnapshotBuilder.build(currentVersion, units.values(), newHashes);
-                return publish(snapshot, units, newSources, newHashes);
+                return publish(st, snapshot, newSources, units, newHashes);
             } finally {
                 updateLock.unlock();
             }
@@ -146,14 +168,16 @@ public class AnalysisService {
             updateLock.lock();
             try {
                 Map<String, ParsedUnit> units = new LinkedHashMap<>();
-                for (Map.Entry<String, String> e : sources.entrySet()) {
+                for (Map.Entry<String, String> e : new TreeMap<>(sources).entrySet()) {
                     units.put(e.getKey(), parser.parse(e.getKey(), e.getValue()));
                 }
                 ApiSnapshot snapshot = SnapshotBuilder.build(baselineVersion, units.values(), hashes(sources));
-                baseline.set(snapshot);
-                baselineSuppressions.clear();
-                units.values().forEach(u -> baselineSuppressions.addAll(u.suppressedKeys()));
-                refreshSuppressions(currentUnits.values());
+                Set<String> suppressions = new HashSet<>();
+                units.values().forEach(u -> suppressions.addAll(u.suppressedKeys()));
+                AnalysisState st = state.get();
+                refreshSuppressions(suppressions, st.currentUnits().values());
+                state.set(new AnalysisState(snapshot, suppressions, st.currentSnapshot(), st.report(),
+                        st.currentSources(), st.currentUnits(), st.currentHashes()));
                 return null;
             } finally {
                 updateLock.unlock();
@@ -165,10 +189,10 @@ public class AnalysisService {
     public void installBaselineSnapshot(ApiSnapshot snapshot, Set<String> suppressions) {
         updateLock.lock();
         try {
-            baseline.set(snapshot);
-            baselineSuppressions.clear();
-            baselineSuppressions.addAll(suppressions);
-            refreshSuppressions(currentUnits.values());
+            AnalysisState st = state.get();
+            refreshSuppressions(suppressions, st.currentUnits().values());
+            state.set(new AnalysisState(snapshot, suppressions, st.currentSnapshot(), st.report(),
+                    st.currentSources(), st.currentUnits(), st.currentHashes()));
         } finally {
             updateLock.unlock();
         }
@@ -178,10 +202,12 @@ public class AnalysisService {
     public void promoteCurrentToBaseline() {
         updateLock.lock();
         try {
-            baseline.set(current.get());
-            baselineSuppressions.clear();
-            currentUnits.values().forEach(u -> baselineSuppressions.addAll(u.suppressedKeys()));
-            refreshSuppressions(currentUnits.values());
+            AnalysisState st = state.get();
+            Set<String> suppressions = new HashSet<>(st.baselineSuppressions());
+            st.currentUnits().values().forEach(u -> suppressions.addAll(u.suppressedKeys()));
+            refreshSuppressions(suppressions, st.currentUnits().values());
+            state.set(new AnalysisState(st.currentSnapshot(), suppressions, st.currentSnapshot(),
+                    st.report(), st.currentSources(), st.currentUnits(), st.currentHashes()));
         } finally {
             updateLock.unlock();
         }
@@ -189,22 +215,22 @@ public class AnalysisService {
 
     /** Latest published report; empty when no analysis has completed yet. */
     public Optional<CompatReport> currentReport() {
-        return Optional.ofNullable(report.get());
+        return Optional.ofNullable(state.get().report());
     }
 
     public ApiSnapshot currentSnapshot() {
-        return current.get();
+        return state.get().currentSnapshot();
     }
 
     public ApiSnapshot baselineSnapshot() {
-        return baseline.get();
+        return state.get().baselineSnapshot();
     }
 
     /** Exemption keys currently attached to the baseline. */
     public Set<String> baselineSuppressions() {
         updateLock.lock();
         try {
-            return Set.copyOf(baselineSuppressions);
+            return state.get().baselineSuppressions();
         } finally {
             updateLock.unlock();
         }
@@ -212,28 +238,25 @@ public class AnalysisService {
 
     // ------------------------------------------------------------------
 
-    private CompatReport publish(ApiSnapshot snapshot, Map<String, ParsedUnit> units,
-                                 Map<String, String> sources, Map<String, String> hashes) {
-        refreshSuppressions(units.values());
-        List<ApiChange> changes = diffEngine.diff(baseline.get(), snapshot, suppressionStore.snapshot());
+    private CompatReport publish(AnalysisState st, ApiSnapshot snapshot, Map<String, String> sources,
+                                 Map<String, ParsedUnit> units, Map<String, String> hashes) {
+        refreshSuppressions(st.baselineSuppressions(), units.values());
+        List<ApiChange> changes = diffEngine.diff(st.baselineSnapshot(), snapshot, suppressionStore.snapshot());
+        String reportId = deterministicReportId(st.baselineSnapshot(), snapshot);
         CompatReport newReport = new CompatReport(
-                "report-" + reportSequence.incrementAndGet(),
-                baseline.get().version(), snapshot.version(), Instant.now(), changes);
-        // Publish the immutable snapshot first, then the report, so a reader
-        // of the report never observes a half-updated pair.
-        currentSources.clear();
-        currentSources.putAll(sources);
-        currentUnits.clear();
-        currentUnits.putAll(units);
-        currentHashes.clear();
-currentHashes.putAll(hashes);
-        current.set(snapshot);
-        report.set(newReport);
+                reportId, st.baselineSnapshot().version(), snapshot.version(), changes);
+        // One atomic publication of the whole (snapshot + report + working
+        // state) pair: a reader can only observe the previous or the next
+        // complete generation, never an intermediate one. On any failure
+        // before this line the previous state stays untouched.
+        AnalysisState next = new AnalysisState(st.baselineSnapshot(), st.baselineSuppressions(),
+                snapshot, newReport, sources, units, hashes);
+        state.set(next);
         return newReport;
     }
 
-    private void refreshSuppressions(Iterable<ParsedUnit> units) {
-        Set<String> all = new HashSet<>(baselineSuppressions);
+    private void refreshSuppressions(Set<String> baselineSuppressionKeys, Iterable<ParsedUnit> units) {
+        Set<String> all = new HashSet<>(baselineSuppressionKeys);
         units.forEach(u -> all.addAll(u.suppressedKeys()));
         suppressionStore.replaceAll(all);
     }
@@ -276,8 +299,30 @@ currentHashes.putAll(hashes);
 
     private static Map<String, String> hashes(Map<String, String> sources) {
         Map<String, String> hashes = new LinkedHashMap<>();
-        sources.forEach((file, content) -> hashes.put(file, sha256(content)));
+        new TreeMap<>(sources).forEach((file, content) -> hashes.put(file, sha256(content)));
         return hashes;
+    }
+
+    /**
+     * Deterministic report id derived solely from the complete contents of the
+     * baseline and current inputs: per-file SHA-256 content hashes (sorted by
+     * file path) together with the two version labels. Any change to any input
+     * file or version changes the id; the same inputs after a restart yield
+     * the same id.
+     */
+    static String deterministicReportId(ApiSnapshot baselineSnapshot, ApiSnapshot currentSnapshot) {
+        String canonical = "baseline:" + baselineSnapshot.version() + "\n"
+                + canonicalHashes(baselineSnapshot.fileHashes())
+                + "current:" + currentSnapshot.version() + "\n"
+                + canonicalHashes(currentSnapshot.fileHashes());
+        return "report-" + sha256(canonical);
+    }
+
+    private static String canonicalHashes(Map<String, String> fileHashes) {
+        StringBuilder sb = new StringBuilder();
+        new TreeMap<>(fileHashes).forEach((file, hash) ->
+                sb.append(file).append('\t').append(hash).append('\n'));
+        return sb.toString();
     }
 
     private static String sha256(String content) {
